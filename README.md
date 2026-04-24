@@ -101,7 +101,7 @@ bash setup-nginx.sh 164.215.97.195 164.215.97.195 8888 8000
 | 10 | Smoke test | SSH-проверка деплоера, статус контейнеров, docker logs + **проверка доступности домена**            |
 
 ---
-## Updatecd
+## Update major
 Скрипт теперь умеет не только генерировать workflow, но и настраивать stage целиком: сервер, `.env`, compose, bootstrap PostgreSQL и GitHub Actions.
 
 Основные возможности:
