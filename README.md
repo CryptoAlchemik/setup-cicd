@@ -84,27 +84,25 @@ bash setup-nginx.sh 164.215.97.195 164.215.97.195 8888 8000
 
 ## Фазы `setup-cicd.sh`
 
-| # | Название | Что делает |
-|---|---|---|
-| 1 | Prerequisites | Проверяет наличие git, ssh, gh и других инструментов |
-| 2 | Repository detection | Определяет `owner/repo` из git remote, создаёт `.gitignore`/`.dockerignore` |
-| 3 | Configure stages | Запрашивает список стейджей (test, prod), хосты и способ авторизации |
-| 4 | Provision server | Создаёт пользователя `deployer`, добавляет его в группу `docker`, создаёт `/opt/<repo>` |
-| 5 | Collect .env | Запрашивает переменные окружения для каждого стейджа, копирует `.env` на сервер |
-| 6 | Generate docker-compose | Генерирует `docker-compose.<stage>.yml`, копирует на сервер |
-| 6.5 | Nginx per stage | Вызывает `setup-nginx.sh`, сохраняет `WEB_URL` в `.env` и загружает на сервер |
-| 7 | Generate workflow | Генерирует `.github/workflows/pipeline.yml` |
-| **7.5** | **Telegram notifications** | **Опционально: настраивает уведомления о деплоях в Telegram** |
+| # | Название | Что делает                                                                                          |
+|---|---|-----------------------------------------------------------------------------------------------------|
+| 1 | Prerequisites | Проверяет наличие git, ssh, gh и других инструментов                                                |
+| 2 | Repository detection | Определяет `owner/repo` из git remote, создаёт `.gitignore`/`.dockerignore`                         |
+| 3 | Configure stages | Запрашивает список стейджей (test, prod), хосты и способ авторизации                                |
+| 4 | Provision server | Создаёт пользователя `deployer`, добавляет его в группу `docker`, создаёт `/opt/<repo>`             |
+| 4.5 | bootstrap PostgreSQL | установка и настройка бд PG                                                                         |
+| 5 | Collect .env | Запрашивает переменные окружения для каждого стейджа, копирует `.env` на сервер                     |
+| 6 | Generate docker-compose | Генерирует `docker-compose.<stage>.yml`, копирует на сервер                                         |
+| 6.5 | Nginx per stage | Вызывает `setup-nginx.sh`, сохраняет `WEB_URL` в `.env` и загружает на сервер                       |
+| 7 | Generate workflow | Генерирует `.github/workflows/pipeline.yml`                                                         |
+| 7.5 | **Telegram notifications** | **Опционально: настраивает уведомления о деплоях в Telegram**                                       |
 | 8 | GitHub secrets & environments | Создаёт GitHub Environments и секреты (`SSH_HOST_*`, `SSH_PRIVATE_KEY_*`, опционально `TELEGRAM_*`) |
-| 9 | Commit & push | Коммитит сгенерированные файлы, пушит `main`, создаёт ветку `develop` |
-| 10 | Smoke test | SSH-проверка деплоера, статус контейнеров, docker logs + **проверка доступности домена** |
+| 9 | Commit & push | Коммитит сгенерированные файлы, пушит `main`, создаёт ветку `develop`                               |
+| 10 | Smoke test | SSH-проверка деплоера, статус контейнеров, docker logs + **проверка доступности домена**            |
 
 ---
-## Update
+## Updatecd
 Скрипт теперь умеет не только генерировать workflow, но и настраивать stage целиком: сервер, `.env`, compose, bootstrap PostgreSQL и GitHub Actions.
-
-Добавлена Фаза деплоя:
-`Phase 4.5` — bootstrap PostgreSQL
 
 Основные возможности:
 - выбор для каждого stage, является ли текущая машина самим stage-хостом
@@ -124,7 +122,6 @@ bash setup-nginx.sh 164.215.97.195 164.215.97.195 8888 8000
 - параметры БД: `db`, `user`, `password`, `port`
 - для `host` и `remote`: CIDR для `pg_hba.conf`
 - для `remote`: SSH-доступ к серверу PostgreSQL для bootstrap
-
 
 
 ### Bootstrap PostgreSQL
