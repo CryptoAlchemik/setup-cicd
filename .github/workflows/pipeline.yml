@@ -1,0 +1,409 @@
+name: CI/CD Pipeline
+
+# ─────────────────────────────────────────────────────────────
+#  Ветки → среды:
+#    develop    →  CI + Deploy test
+#    main       →  CI + Deploy prod#
+#  Workflow разработки:
+#    git push develop   →  автодеплой на тест
+#    PR develop → main  →  автодеплой на прод после merge
+#
+#  GitHub Secrets:
+#    SSH_HOST_*, SSH_PRIVATE_KEY_*
+#    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# ─────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  DEPLOY_USER: deployer
+  DEPLOY_DIR: /opt/biohacker-bot
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────
+  # CI — lint + docker build  (runs on every push / PR)
+  # ───────────────────────────────────────────────────────────
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps + linter
+        run: pip install -r requirements.txt ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Docker build smoke-test
+        run: docker build -t app:ci-test .
+
+
+  # ───────────────────────────────────────────────────────────
+  # Deploy → test   (develop branch only, needs: ci)
+  # ───────────────────────────────────────────────────────────
+  deploy-test:
+    name: "Deploy → test"
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment: test
+    outputs:
+      health: ${{ steps.health.outputs.result }}
+      app_logs: ${{ steps.health.outputs.logs }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push → test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:test-${{ github.sha }}
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY_TEST }}
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ secrets.SSH_HOST_TEST }} >> ~/.ssh/known_hosts
+
+      - name: Upload compose file
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_TEST }}
+        run: |
+          scp -P 22 docker-compose.test.yml deployer@$SSH_HOST:/opt/biohacker-bot/docker-compose.test.yml
+
+      - name: Deploy via SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_TEST }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          ssh -p 22 deployer@$SSH_HOST bash << 'SSHEOF'
+            set -e
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u $ACTOR --password-stdin
+            cd /opt/biohacker-bot
+            test -f .env
+            DB_URL=$(grep '^DATABASE_URL=' .env | cut -d= -f2- || true)
+            if [[ -z "$DB_URL" ]]; then
+              echo "DATABASE_URL is missing in /opt/biohacker-bot/.env" >&2
+              exit 1
+            fi
+            if [[ "$DB_URL" == *"@localhost:"* || "$DB_URL" == *"@127.0.0.1:"* ]]; then
+              echo "DATABASE_URL points to localhost/127.0.0.1; container will not reach host PostgreSQL" >&2
+              exit 1
+            fi
+            grep -q 'host.docker.internal:host-gateway' docker-compose.test.yml || {
+              echo "docker-compose.test.yml is missing host-gateway mapping" >&2
+              exit 1
+            }
+            docker compose -f docker-compose.test.yml config -q
+            docker compose -f docker-compose.test.yml pull
+            docker compose -f docker-compose.test.yml up -d --remove-orphans
+            docker image prune -f
+          SSHEOF
+
+      - name: Health check — container + domain
+        id: health
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_TEST }}
+        run: |
+          sleep 8
+          RAW=$(ssh -p 22 deployer@$SSH_HOST bash << 'HEALTHEOF'
+            cd /opt/biohacker-bot
+            CONTAINERS=$(docker compose -f docker-compose.test.yml ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | tail -n +2)
+            LOGS=$(docker compose -f docker-compose.test.yml logs --tail=20 bot 2>&1)
+            LOCAL_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 8 http://localhost:8000/ 2>/dev/null || echo "NO_RESPONSE")
+            WEB_URL=$(grep '^WEB_URL=' .env 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "")
+            if [[ -n "$WEB_URL" ]]; then
+              DOMAIN_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 12 "$WEB_URL/" 2>/dev/null || echo "NO_RESPONSE")
+            else
+              DOMAIN_HTTP="NO_URL"
+            fi
+            echo "---CONTAINERS---"
+            echo "$CONTAINERS"
+            echo "---LOCAL---"
+            echo "$LOCAL_HTTP"
+            echo "---DOMAIN---"
+            echo "$DOMAIN_HTTP $WEB_URL"
+            echo "---LOGS---"
+            echo "$LOGS"
+          HEALTHEOF
+          )
+          echo "$RAW"
+
+          LOCAL_CODE=$(echo "$RAW" | grep -A1 '^---LOCAL---' | tail -1 | tr -d '[:space:]')
+          DOMAIN_LINE=$(echo "$RAW" | grep -A1 '^---DOMAIN---' | tail -1)
+          DOMAIN_CODE=$(echo "$DOMAIN_LINE" | awk '{print $1}')
+          DOMAIN_URL=$(echo "$DOMAIN_LINE" | awk '{print $2}')
+          LOGS=$(echo "$RAW" | sed -n '/^---LOGS---/,$p' | tail -n +2)
+
+          # Build result string
+          if [[ "$LOCAL_CODE" =~ ^(200|301|302|404)$ ]]; then
+            LOCAL_STATUS="✅ localhost:$LOCAL_CODE"
+          else
+            LOCAL_STATUS="❌ localhost:$LOCAL_CODE"
+          fi
+          if [[ "$DOMAIN_CODE" =~ ^(200|301|302|404)$ ]]; then
+            DOMAIN_STATUS="✅ domain:$DOMAIN_CODE"
+          elif [[ "$DOMAIN_CODE" == "NO_URL" ]]; then
+            DOMAIN_STATUS="— domain:no WEB_URL"
+          else
+            DOMAIN_STATUS="❌ domain:$DOMAIN_CODE ($DOMAIN_URL)"
+          fi
+
+          RESULT="$LOCAL_STATUS | $DOMAIN_STATUS"
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+
+          SHORT_LOGS=$(echo "$LOGS" | tail -15 | cut -c1-900)
+          SHORT_LOGS="${SHORT_LOGS//'%'/'%25'}"
+          SHORT_LOGS="${SHORT_LOGS//$'\n'/'%0A'}"
+          SHORT_LOGS="${SHORT_LOGS//$'\r'/'%0D'}"
+          echo "logs=$SHORT_LOGS" >> $GITHUB_OUTPUT
+
+
+  # ───────────────────────────────────────────────────────────
+  # Deploy → prod   (main branch only, needs: ci)
+  # ───────────────────────────────────────────────────────────
+  deploy-prod:
+    name: "Deploy → prod"
+    runs-on: ubuntu-latest
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: prod
+    outputs:
+      health: ${{ steps.health.outputs.result }}
+      app_logs: ${{ steps.health.outputs.logs }}
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase image name
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push → prod
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:prod-${{ github.sha }}
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY_PROD }}
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ secrets.SSH_HOST_PROD }} >> ~/.ssh/known_hosts
+
+      - name: Upload compose file
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_PROD }}
+        run: |
+          scp -P 22 docker-compose.prod.yml deployer@$SSH_HOST:/opt/biohacker-bot/docker-compose.prod.yml
+
+      - name: Deploy via SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_PROD }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          ssh -p 22 deployer@$SSH_HOST bash << 'SSHEOF'
+            set -e
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u $ACTOR --password-stdin
+            cd /opt/biohacker-bot
+            test -f .env
+            DB_URL=$(grep '^DATABASE_URL=' .env | cut -d= -f2- || true)
+            if [[ -z "$DB_URL" ]]; then
+              echo "DATABASE_URL is missing in /opt/biohacker-bot/.env" >&2
+              exit 1
+            fi
+            if [[ "$DB_URL" == *"@localhost:"* || "$DB_URL" == *"@127.0.0.1:"* ]]; then
+              echo "DATABASE_URL points to localhost/127.0.0.1; container will not reach host PostgreSQL" >&2
+              exit 1
+            fi
+            grep -q 'host.docker.internal:host-gateway' docker-compose.prod.yml || {
+              echo "docker-compose.prod.yml is missing host-gateway mapping" >&2
+              exit 1
+            }
+            docker compose -f docker-compose.prod.yml config -q
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+          SSHEOF
+
+      - name: Health check — container + domain
+        id: health
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST_PROD }}
+        run: |
+          sleep 8
+          RAW=$(ssh -p 22 deployer@$SSH_HOST bash << 'HEALTHEOF'
+            cd /opt/biohacker-bot
+            CONTAINERS=$(docker compose -f docker-compose.prod.yml ps --format "table {{.Name}}\t{{.Status}}" 2>/dev/null | tail -n +2)
+            LOGS=$(docker compose -f docker-compose.prod.yml logs --tail=20 bot 2>&1)
+            LOCAL_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 8 http://localhost:8000/ 2>/dev/null || echo "NO_RESPONSE")
+            WEB_URL=$(grep '^WEB_URL=' .env 2>/dev/null | cut -d= -f2- | tr -d '"' || echo "")
+            if [[ -n "$WEB_URL" ]]; then
+              DOMAIN_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 12 "$WEB_URL/" 2>/dev/null || echo "NO_RESPONSE")
+            else
+              DOMAIN_HTTP="NO_URL"
+            fi
+            echo "---CONTAINERS---"
+            echo "$CONTAINERS"
+            echo "---LOCAL---"
+            echo "$LOCAL_HTTP"
+            echo "---DOMAIN---"
+            echo "$DOMAIN_HTTP $WEB_URL"
+            echo "---LOGS---"
+            echo "$LOGS"
+          HEALTHEOF
+          )
+          echo "$RAW"
+
+          LOCAL_CODE=$(echo "$RAW" | grep -A1 '^---LOCAL---' | tail -1 | tr -d '[:space:]')
+          DOMAIN_LINE=$(echo "$RAW" | grep -A1 '^---DOMAIN---' | tail -1)
+          DOMAIN_CODE=$(echo "$DOMAIN_LINE" | awk '{print $1}')
+          DOMAIN_URL=$(echo "$DOMAIN_LINE" | awk '{print $2}')
+          LOGS=$(echo "$RAW" | sed -n '/^---LOGS---/,$p' | tail -n +2)
+
+          # Build result string
+          if [[ "$LOCAL_CODE" =~ ^(200|301|302|404)$ ]]; then
+            LOCAL_STATUS="✅ localhost:$LOCAL_CODE"
+          else
+            LOCAL_STATUS="❌ localhost:$LOCAL_CODE"
+          fi
+          if [[ "$DOMAIN_CODE" =~ ^(200|301|302|404)$ ]]; then
+            DOMAIN_STATUS="✅ domain:$DOMAIN_CODE"
+          elif [[ "$DOMAIN_CODE" == "NO_URL" ]]; then
+            DOMAIN_STATUS="— domain:no WEB_URL"
+          else
+            DOMAIN_STATUS="❌ domain:$DOMAIN_CODE ($DOMAIN_URL)"
+          fi
+
+          RESULT="$LOCAL_STATUS | $DOMAIN_STATUS"
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
+
+          SHORT_LOGS=$(echo "$LOGS" | tail -15 | cut -c1-900)
+          SHORT_LOGS="${SHORT_LOGS//'%'/'%25'}"
+          SHORT_LOGS="${SHORT_LOGS//$'\n'/'%0A'}"
+          SHORT_LOGS="${SHORT_LOGS//$'\r'/'%0D'}"
+          echo "logs=$SHORT_LOGS" >> $GITHUB_OUTPUT
+
+
+  # ───────────────────────────────────────────────────────────
+  # Telegram notify  (always, after all jobs)
+  # ───────────────────────────────────────────────────────────
+  notify:
+    name: "Telegram notify"
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ci, deploy-test, deploy-prod]
+    steps:
+      - name: Send report
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CI_STATUS: ${{ needs.ci.result }}
+          DEPLOY_TEST_STATUS: ${{ needs.deploy-test.result }}
+          DEPLOY_TEST_HEALTH: ${{ needs.deploy-test.outputs.health }}
+          DEPLOY_TEST_LOGS: ${{ needs.deploy-test.outputs.app_logs }}
+          DEPLOY_PROD_STATUS: ${{ needs.deploy-prod.result }}
+          DEPLOY_PROD_HEALTH: ${{ needs.deploy-prod.outputs.health }}
+          DEPLOY_PROD_LOGS: ${{ needs.deploy-prod.outputs.app_logs }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          ci_icon()    { [[ "$1" == "success" ]] && echo "✅" || [[ "$1" == "skipped" ]] && echo "⏭" || echo "❌"; }
+          deploy_icon(){ [[ "$1" == "success" ]] && echo "🚀" || [[ "$1" == "skipped" ]] && echo "—" || echo "💥"; }
+
+          CI_ICON=$(ci_icon "$CI_STATUS")
+          COMMIT_FIRST=$(echo "$COMMIT_MSG" | head -1 | cut -c1-80)
+
+          TEXT="${CI_ICON} <b>CI/CD · ${BRANCH}</b>
+          <code>${COMMIT_FIRST}</code>
+          👤 ${ACTOR}
+
+          CI: ${CI_ICON} ${CI_STATUS}"
+
+          if [[ "$DEPLOY_TEST_STATUS" != "skipped" ]]; then
+            ICON=$(deploy_icon "$DEPLOY_TEST_STATUS")
+            TEXT="${TEXT}
+          Deploy test: ${ICON} $DEPLOY_TEST_STATUS
+          Health test: ${DEPLOY_TEST_HEALTH:-—}"
+          fi
+          if [[ "$DEPLOY_PROD_STATUS" != "skipped" ]]; then
+            ICON=$(deploy_icon "$DEPLOY_PROD_STATUS")
+            TEXT="${TEXT}
+          Deploy prod: ${ICON} $DEPLOY_PROD_STATUS
+          Health prod: ${DEPLOY_PROD_HEALTH:-—}"
+          fi
+          TEXT="${TEXT}
+
+          <a href=\"${RUN_URL}\">📋 Открыть run</a>"
+
+          if [[ "$DEPLOY_TEST_STATUS" == "success" && "$DEPLOY_TEST_HEALTH" == *"❌"* && -n "$DEPLOY_TEST_LOGS" ]]; then
+            DECODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$DEPLOY_TEST_LOGS" 2>/dev/null || echo "$DEPLOY_TEST_LOGS")
+            TEXT="${TEXT}
+
+          <b>📜 Логи test:</b>
+          <pre>${DECODED}</pre>"
+          fi
+          if [[ "$DEPLOY_PROD_STATUS" == "success" && "$DEPLOY_PROD_HEALTH" == *"❌"* && -n "$DEPLOY_PROD_LOGS" ]]; then
+            DECODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$DEPLOY_PROD_LOGS" 2>/dev/null || echo "$DEPLOY_PROD_LOGS")
+            TEXT="${TEXT}
+
+          <b>📜 Логи prod:</b>
+          <pre>${DECODED}</pre>"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d parse_mode="HTML" \
+            -d disable_web_page_preview="true" \
+            --data-urlencode "text=${TEXT}" \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); print('Sent OK' if r.get('ok') else f'TG error: {r}')"
